@@ -3,9 +3,25 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { FaArrowLeft, FaSave, FaCheck, FaMagic, FaKeyboard, FaClock, FaFont } from 'react-icons/fa';
+import { FaArrowLeft, FaSave, FaCheck, FaMagic, FaKeyboard, FaClock, FaFont, FaBook } from 'react-icons/fa';
 import { supabase } from '../../../lib/supabaseClient';
 import { checkGrammar } from '../../../lib/grammarCheck';
+import { calculateReadability, ReadabilityScore } from '../../../lib/readabilityScore';
+
+// Add a debounce function at the top of your component
+const useDebounce = (callback: Function, delay: number) => {
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
+  
+  return useCallback((...args: any[]) => {
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+    }
+    
+    timeoutRef.current = setTimeout(() => {
+      callback(...args);
+    }, delay);
+  }, [callback, delay]);
+};
 
 export default function Editor({ params }: { params: { id: string } }) {
   const [title, setTitle] = useState('Untitled Document');
@@ -16,7 +32,17 @@ export default function Editor({ params }: { params: { id: string } }) {
   const [message, setMessage] = useState({ text: '', type: '' });
   const [grammarSuggestions, setGrammarSuggestions] = useState<any[]>([]);
   const [sessionError, setSessionError] = useState(false);
-  const [stats, setStats] = useState({ words: 0, chars: 0, readingTime: 0 });
+  const [stats, setStats] = useState({ 
+    words: 0, 
+    chars: 0, 
+    readingTime: 0,
+    readability: {
+      score: 0,
+      grade: 0,
+      level: 'N/A',
+      description: 'Add some text to see readability score'
+    }
+  });
   const [showKeyboardShortcuts, setShowKeyboardShortcuts] = useState(false);
   const [lastSaved, setLastSaved] = useState<Date | null>(null);
   const [autoSaveEnabled, setAutoSaveEnabled] = useState(true);
@@ -28,6 +54,7 @@ export default function Editor({ params }: { params: { id: string } }) {
   // Update content ref when content changes
   useEffect(() => {
     contentRef.current = content;
+    console.log("Editor: Content ref updated:", content.substring(0, 50) + (content.length > 50 ? "..." : ""));
   }, [content]);
 
   // Check session validity
@@ -58,48 +85,104 @@ export default function Editor({ params }: { params: { id: string } }) {
     const chars = text.length;
     // Average reading time: 200 words per minute
     const readingTime = Math.ceil(words / 200);
+    // Calculate readability
+    const readability = calculateReadability(text);
     
-    setStats({ words, chars, readingTime });
+    setStats({ words, chars, readingTime, readability });
   }, []);
 
   // Auto-save function
   const autoSave = useCallback(async () => {
-    if (!autoSaveEnabled || !contentRef.current) return;
+    if (!autoSaveEnabled) return;
+    
+    try {
+      console.log("Editor: Auto-saving document...");
+      const sessionValid = await checkSession();
+      if (!sessionValid) return;
+      
+      // Get the current content directly from state, not from ref
+      console.log("Editor: Auto-saving content length:", content.length);
+      
+      const { error } = await supabase
+        .from('documents')
+        .update({
+          title,
+          content, // Use content from state, not contentRef
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', id);
+        
+      if (error) {
+        console.error("Editor: Auto-save error:", error);
+        return;
+      }
+      
+      console.log("Editor: Auto-save successful");
+      setLastSaved(new Date());
+    } catch (error) {
+      console.error('Editor: Auto-save error:', error);
+    }
+  }, [autoSaveEnabled, id, title, content, checkSession]); // Add content to dependencies
+
+  // Create a debounced version of autoSave
+  const debouncedSave = useDebounce(async () => {
+    console.log("Editor: Debounced save triggered");
+    if (!autoSaveEnabled) return;
     
     try {
       const sessionValid = await checkSession();
       if (!sessionValid) return;
       
-      await supabase
+      console.log("Editor: Saving content after change, length:", content.length);
+      
+      const { error } = await supabase
         .from('documents')
         .update({
           title,
-          content: contentRef.current,
+          content,
           updated_at: new Date().toISOString()
         })
         .eq('id', id);
+        
+      if (error) {
+        console.error("Editor: Debounced save error:", error);
+        return;
+      }
       
+      console.log("Editor: Debounced save successful");
       setLastSaved(new Date());
     } catch (error) {
-      console.error('Auto-save error:', error);
+      console.error('Editor: Debounced save error:', error);
     }
-  }, [autoSaveEnabled, id, title, checkSession]);
+  }, 2000); // 2 second delay after typing stops
 
-  // Set up auto-save timer
+  // Set up auto-save timer - use a different approach
   useEffect(() => {
+    let autoSaveInterval: NodeJS.Timeout | null = null;
+    
     if (autoSaveEnabled && !loading) {
+      console.log("Editor: Setting up auto-save timer");
+      
+      // Clear any existing timer
       if (autoSaveTimerRef.current) {
         clearInterval(autoSaveTimerRef.current);
       }
       
-      autoSaveTimerRef.current = setInterval(() => {
+      // Set up a new timer - more frequent
+      autoSaveInterval = setInterval(() => {
+        console.log("Editor: Auto-save timer triggered");
         autoSave();
-      }, 30000); // Auto-save every 30 seconds
+      }, 5000); // Auto-save every 5 seconds
+      
+      // Store the timer reference
+      autoSaveTimerRef.current = autoSaveInterval;
     }
     
+    // Cleanup function
     return () => {
-      if (autoSaveTimerRef.current) {
-        clearInterval(autoSaveTimerRef.current);
+      console.log("Editor: Cleaning up auto-save timer");
+      if (autoSaveInterval) {
+        clearInterval(autoSaveInterval);
       }
     };
   }, [autoSaveEnabled, loading, autoSave]);
@@ -107,11 +190,15 @@ export default function Editor({ params }: { params: { id: string } }) {
   // Save document
   const handleSave = useCallback(async () => {
     try {
+      console.log("Editor: Manual save initiated");
       setSaving(true);
       setMessage({ text: '', type: '' });
       
       const sessionValid = await checkSession();
       if (!sessionValid) return;
+      
+      // Log the content being saved (first 50 chars)
+      console.log("Editor: Saving content:", content.substring(0, 50) + (content.length > 50 ? "..." : ""));
       
       const { error } = await supabase
         .from('documents')
@@ -123,10 +210,12 @@ export default function Editor({ params }: { params: { id: string } }) {
         .eq('id', id);
       
       if (error) {
-        setMessage({ text: 'Error saving document', type: 'error' });
+        console.error("Editor: Save error:", error);
+        setMessage({ text: 'Error saving document: ' + error.message, type: 'error' });
         return;
       }
       
+      console.log("Editor: Manual save successful");
       setMessage({ text: 'Document saved successfully', type: 'success' });
       setLastSaved(new Date());
       
@@ -135,7 +224,7 @@ export default function Editor({ params }: { params: { id: string } }) {
         setMessage({ text: '', type: '' });
       }, 3000);
     } catch (error) {
-      console.error('Error:', error);
+      console.error('Editor: Save error:', error);
       setMessage({ text: 'An unexpected error occurred', type: 'error' });
     } finally {
       setSaving(false);
@@ -252,9 +341,17 @@ export default function Editor({ params }: { params: { id: string } }) {
     calculateStats(content);
   }, [content, calculateStats]);
 
-  // Handle content change
+  // Update the content change handler to trigger debounced save
   const handleContentChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setContent(e.target.value);
+    const newContent = e.target.value;
+    console.log("Editor: Content changed, length:", newContent.length);
+    setContent(newContent);
+    calculateStats(newContent);
+    
+    // Trigger debounced save when content changes
+    if (autoSaveEnabled) {
+      debouncedSave();
+    }
   };
 
   // Apply grammar suggestion
@@ -325,6 +422,12 @@ export default function Editor({ params }: { params: { id: string } }) {
               </div>
               <div className="flex items-center">
                 <FaClock className="mr-1" /> {stats.readingTime} min read
+              </div>
+              <div className="flex items-center">
+                <FaBook className="mr-1" /> 
+                <span title={stats.readability.description}>
+                  {stats.readability.level} ({stats.readability.score}/100)
+                </span>
               </div>
               <div>
                 Last saved: {formatLastSaved()}
@@ -475,6 +578,49 @@ export default function Editor({ params }: { params: { id: string } }) {
             </div>
           </div>
         )}
+        
+        <div className="bg-white rounded-lg shadow-md p-4 mb-6">
+          <h3 className="text-lg font-medium mb-2">Readability Analysis</h3>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="bg-gray-50 p-3 rounded">
+              <div className="text-2xl font-bold text-center">{stats.readability.score}</div>
+              <div className="text-sm text-center text-gray-600">Readability Score</div>
+              <div className="mt-2 text-xs text-center">
+                {stats.readability.score >= 70 ? (
+                  <span className="text-green-600">Easy to read</span>
+                ) : stats.readability.score >= 50 ? (
+                  <span className="text-yellow-600">Moderately difficult</span>
+                ) : (
+                  <span className="text-red-600">Difficult to read</span>
+                )}
+              </div>
+            </div>
+            <div className="bg-gray-50 p-3 rounded">
+              <div className="text-2xl font-bold text-center">{stats.readability.grade}</div>
+              <div className="text-sm text-center text-gray-600">Grade Level</div>
+              <div className="mt-2 text-xs text-center">
+                {stats.readability.grade <= 8 ? (
+                  <span className="text-green-600">Elementary/Middle School</span>
+                ) : stats.readability.grade <= 12 ? (
+                  <span className="text-yellow-600">High School</span>
+                ) : (
+                  <span className="text-red-600">College Level</span>
+                )}
+              </div>
+            </div>
+            <div className="bg-gray-50 p-3 rounded">
+              <div className="text-lg font-medium text-center">{stats.readability.level}</div>
+              <div className="text-sm text-center text-gray-600">Reading Level</div>
+              <div className="mt-2 text-xs text-center">{stats.readability.description}</div>
+            </div>
+          </div>
+          <div className="mt-4 text-sm text-gray-600">
+            <p>
+              <strong>Tips to improve readability:</strong> Use shorter sentences, simpler words, and active voice. 
+              Break up long paragraphs and avoid jargon when possible.
+            </p>
+          </div>
+        </div>
       </div>
     </div>
   );

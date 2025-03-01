@@ -4,7 +4,7 @@ import React, { useEffect, useState } from 'react';
 import { supabase } from '../../lib/supabaseClient';
 import { useRouter } from 'next/navigation';
 import DocumentList from '../../components/DocumentList';
-import { FaChartLine } from 'react-icons/fa';
+import { FaChartLine, FaExclamationTriangle } from 'react-icons/fa';
 
 export default function Dashboard() {
   const router = useRouter();
@@ -12,18 +12,33 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('documents');
   const [sessionError, setSessionError] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
+    // Simple exponential backoff for retries
+    const retryDelay = Math.min(1000 * Math.pow(2, retryCount), 10000);
+    
     const checkSession = async () => {
       try {
+        console.log("Dashboard: Checking session...");
         setLoading(true);
         
         // Check if session is valid
         const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
         
-        if (sessionError || !sessionData.session) {
-          console.log("No valid session found");
+        if (sessionError) {
+          console.error("Dashboard: Session error:", sessionError);
           setSessionError(true);
+          setLoadError("Session error: " + sessionError.message);
+          setTimeout(() => router.push('/signin'), 2000);
+          return;
+        }
+        
+        if (!sessionData.session) {
+          console.log("Dashboard: No valid session found");
+          setSessionError(true);
+          setLoadError("No active session found");
           setTimeout(() => router.push('/signin'), 2000);
           return;
         }
@@ -31,19 +46,41 @@ export default function Dashboard() {
         // Get user data
         const { data: userData, error: userError } = await supabase.auth.getUser();
         
-        if (userError || !userData.user) {
-          console.log("No valid user found");
+        if (userError) {
+          console.error("Dashboard: User error:", userError);
           setSessionError(true);
+          setLoadError("User error: " + userError.message);
           setTimeout(() => router.push('/signin'), 2000);
           return;
         }
         
+        if (!userData.user) {
+          console.log("Dashboard: No valid user found");
+          setSessionError(true);
+          setLoadError("No user found");
+          setTimeout(() => router.push('/signin'), 2000);
+          return;
+        }
+        
+        console.log("Dashboard: Session valid, user found");
         setUser(userData.user);
+        setLoadError(null);
         setLoading(false);
       } catch (err) {
-        console.error("Error checking session:", err);
-        setSessionError(true);
-        setTimeout(() => router.push('/signin'), 2000);
+        console.error("Dashboard: Error checking session:", err);
+        setLoadError("Unexpected error: " + (err instanceof Error ? err.message : String(err)));
+        
+        // Retry logic
+        if (retryCount < 3) {
+          console.log(`Dashboard: Retrying in ${retryDelay}ms (attempt ${retryCount + 1})`);
+          setTimeout(() => {
+            setRetryCount(prev => prev + 1);
+            checkSession();
+          }, retryDelay);
+        } else {
+          setSessionError(true);
+          setTimeout(() => router.push('/signin'), 2000);
+        }
       }
     };
 
@@ -51,16 +88,21 @@ export default function Dashboard() {
 
     const { data: authListener } = supabase.auth.onAuthStateChange(
       (event, session) => {
-        if (event === 'SIGNED_OUT' || event === 'USER_DELETED') {
+        console.log("Dashboard: Auth state changed:", event);
+        if (event === 'SIGNED_OUT' || event === 'USER_DELETED' as any) {
           router.push('/');
+        } else if (event === 'SIGNED_IN' && session) {
+          setUser(session.user);
+          setLoading(false);
         }
       }
     );
 
     return () => {
+      console.log("Dashboard: Cleaning up auth listener");
       authListener.subscription.unsubscribe();
     };
-  }, [router]);
+  }, [router, retryCount]);
 
   if (loading) {
     return (
@@ -72,6 +114,17 @@ export default function Dashboard() {
               ? "Session expired. Redirecting to login..." 
               : "Loading your dashboard..."}
           </p>
+          {loadError && (
+            <div className="mt-4 text-red-500 flex items-center justify-center">
+              <FaExclamationTriangle className="mr-2" />
+              <span className="text-sm">{loadError}</span>
+            </div>
+          )}
+          {retryCount > 0 && !sessionError && (
+            <p className="mt-2 text-sm text-gray-500">
+              Retry attempt {retryCount}/3...
+            </p>
+          )}
         </div>
       </div>
     );
